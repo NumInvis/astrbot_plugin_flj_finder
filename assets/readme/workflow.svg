@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="830" viewBox="0 0 1200 830" role="img" aria-labelledby="title desc">
+  <title id="title">靓鸡甄选 FLJ 的图片找出处流程</title>
+  <desc id="desc">发送或引用图片并输入找鸡，机器人回复正在靓鸡甄选，完全匹配后追查 X 线索，只返回一条 X 结果。取得名字和账号后发送表情图。</desc>
+  <rect width="1200" height="830" rx="28" fill="#fff8e8"/>
+  <g font-family="Segoe UI, Microsoft YaHei, PingFang SC, sans-serif" fill="#2b2518">
+    <text x="70" y="87" font-size="42" font-weight="700">一张图，追到来源。</text>
+    <text x="1130" y="85" font-size="25" text-anchor="end" fill="#6b6253">FLJ / 靓鸡甄选</text>
+    <g id="input">
+      <rect x="70" y="135" width="1060" height="155" rx="26" fill="#f6c45c"/>
+      <rect x="110" y="168" width="86" height="86" rx="13" fill="#fff8e8"/>
+      <circle cx="171" cy="189" r="9" fill="#d88614"/>
+      <path d="M121 240l23-28 15 17 11-12 17 23z" fill="#d88614"/>
+      <text x="231" y="205" font-size="48" font-weight="700">图片 + 找鸡</text>
+      <text x="231" y="256" font-size="34">也可以引用图片后发送指令</text>
+    </g>
+    <path d="M600 304v35m-13-12 13 13 13-13" fill="none" stroke="#d88614" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g id="search">
+      <circle cx="150" cy="416" r="28" fill="none" stroke="#193c47" stroke-width="7"/>
+      <path d="m170 438 24 25" stroke="#193c47" stroke-width="9" stroke-linecap="round"/>
+      <text x="231" y="417" font-size="48" font-weight="700">正在靓鸡甄选</text>
+      <text x="231" y="470" font-size="34" fill="#6b6253">完全匹配 · 没有命中再追查线索</text>
+    </g>
+    <path d="M600 499v35m-13-12 13 13 13-13" fill="none" stroke="#d88614" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g id="results">
+      <rect x="70" y="560" width="1060" height="202" rx="26" fill="#193c47"/>
+      <path d="m117 622 17 18 34-38" fill="none" stroke="#f6c45c" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="231" y="628" font-size="48" font-weight="700" fill="#fff8e8">选出一条最相关的 X 来源</text>
+      <text x="231" y="686" font-size="34" fill="#fff8e8">平台 · 名字 · 账号 · 来源链接</text>
+      <text x="231" y="734" font-size="30" fill="#f6c45c">取得名字和账号，再送上表情图</text>
+    </g>
+  </g>
+</svg>
