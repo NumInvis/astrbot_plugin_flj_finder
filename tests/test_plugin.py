@@ -4,7 +4,7 @@ import asyncio
 import base64
 import io
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from astrbot.api.event import AstrMessageEvent
@@ -65,6 +65,58 @@ def sent_text(event):
         for part in result.chain
         if isinstance(part, Plain)
     ]
+
+
+@pytest.mark.parametrize("provider_id", ["", "chosen-provider"])
+@pytest.mark.parametrize("log_candidates", [False, True])
+async def test_title_llm_uses_text_only_session_or_explicit_provider(
+    plugin, provider_id, log_candidates
+):
+    import json
+
+    plugin.config["title_llm_provider_id"] = provider_id
+    plugin.config["log_title_candidates"] = log_candidates
+    event = make_event()
+    source = {"url": "https://source.example/photo", "title": "X ID: sample_01"}
+    response = {
+        "candidates": [
+            {
+                "handle": "sample_01",
+                "source_index": 0,
+                "evidence": source["title"],
+                "confidence": 0.9,
+                "platform": "X",
+            }
+        ]
+    }
+    plugin.context = SimpleNamespace(
+        get_current_chat_provider_id=AsyncMock(return_value="session-provider"),
+        llm_generate=AsyncMock(
+            return_value=SimpleNamespace(completion_text=json.dumps(response))
+        ),
+    )
+    with patch.object(main, "logger") as logger:
+        candidates = await plugin._extract_title_accounts(event, [source])
+    assert candidates[0]["platform"] == "X"
+    args = plugin.context.llm_generate.await_args.kwargs
+    assert args["chat_provider_id"] == (provider_id or "session-provider")
+    assert args["contexts"] == []
+    assert args["request_max_retries"] == 1
+    assert "image_urls" not in args and "tools" not in args
+    assert "sample_01" in args["prompt"]
+    if log_candidates:
+        logger.info.assert_called_once()
+        assert "unverified text" in logger.info.call_args.args[0]
+        assert "sample_01" in logger.info.call_args.args[1]
+        assert "explicit_source_platform" in logger.info.call_args.args[1]
+    else:
+        logger.info.assert_not_called()
+    if not provider_id:
+        plugin.context.get_current_chat_provider_id.assert_awaited_once_with(
+            event.unified_msg_origin
+        )
+    else:
+        plugin.context.get_current_chat_provider_id.assert_not_awaited()
 
 
 @pytest.fixture
@@ -619,7 +671,63 @@ def test_format_report_preserves_partial_engine_failure():
 
 
 def test_format_report_only_calls_completed_empty_search_not_found():
-    assert "这次没有找到 X/Twitter 的同图出处" in main.format_report(SearchReport())
+    assert "这次没有找到同图结果" in main.format_report(SearchReport())
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_format_report_distinguishes_exact_matches_without_x_source(blocked):
+    report = SearchReport(
+        exact_sources=[
+            SearchResult(
+                url="https://source.example/photo",
+                title="PRIVATE_TITLE_SENTINEL",
+                verified=True,
+            )
+        ],
+        errors={"source_page": "部分精确匹配来源页面无法读取"} if blocked else {},
+    )
+    text = main.format_report(report)
+    assert "已找到同图页面" in text
+    assert "X 来源" in text
+    assert ("来源页面无法读取" in text) == blocked
+    assert "识图引擎未能完成" not in text
+    assert "没有找到同图结果" not in text
+    assert "source.example" not in text
+    assert "PRIVATE_TITLE_SENTINEL" not in text
+
+
+async def test_stage_logs_contain_counts_and_status_but_no_source_content(
+    plugin, image
+):
+    plugin.service.search.return_value = SearchReport(
+        exact_sources=[
+            SearchResult(
+                url="https://source.example/PRIVATE_PATH_SENTINEL?token=TOKEN_SENTINEL",
+                title="PRIVATE_TITLE_SENTINEL",
+                verified=True,
+            )
+        ],
+        engine_results={"google_lens": 1},
+        source_pages={"source.example": "HTTP 403"},
+        errors={"source_page": "部分精确匹配来源页面无法读取"},
+    )
+    event = make_event([image])
+    with patch.object(main, "logger") as logger:
+        await plugin.find_source(event)
+    logged = "\n".join(
+        call.args[0] % call.args[1:] if len(call.args) > 1 else call.args[0]
+        for call in logger.info.call_args_list
+    )
+    assert "exact_sources=1" in logged
+    assert "x_candidates=0" in logged
+    assert "source.example" in logged
+    assert "HTTP 403" in logged
+    assert "SENTINEL" not in logged
+    assert "https://" not in logged
+    assert "已找到同图页面" in sent_text(event)[1]
+    assert not any(
+        isinstance(part, Image) for result in event.sent for part in result.chain
+    )
 
 
 def test_format_report_never_returns_other_platforms_or_treats_them_as_success():
@@ -634,7 +742,7 @@ def test_format_report_never_returns_other_platforms_or_treats_them_as_success()
     )
     assert "weibo.com" not in text
     assert "靓鸡甄选结果" not in text
-    assert "没有找到 X/Twitter" in text
+    assert "没有找到同图结果" in text
 
 
 def test_format_report_shows_only_selected_source_without_numbering():
@@ -677,6 +785,10 @@ def test_format_report_selected_result_is_exactly_five_lines_and_hides_diagnosti
             ),
         ],
         errors={"baidu": "搜索超时"},
+        exact_sources=[SearchResult(title="PRIVATE_TITLE_SENTINEL", verified=True)],
+        engine_results={"google_lens": 1, "baidu": 0},
+        source_pages={"source.example": "HTTP 403"},
+        x_candidate_count=1,
     )
     assert main.format_report(report).splitlines() == [
         "🎯 靓鸡甄选结果",

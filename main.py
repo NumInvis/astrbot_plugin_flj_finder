@@ -15,7 +15,19 @@ from astrbot.api.star import Context, Star
 from PIL import Image as PILImage
 from PIL import ImageOps, UnidentifiedImageError
 
-from .search import UNKNOWN_ACCOUNT, SearchReport, SearchService, choose_best
+from .search import (
+    TITLE_LLM_TIMEOUT,
+    UNKNOWN_ACCOUNT,
+    SearchReport,
+    SearchService,
+    choose_best,
+)
+from .title_llm import (
+    SYSTEM_PROMPT,
+    build_title_prompt,
+    format_candidate_diagnostics,
+    parse_title_candidates,
+)
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 SUCCESS_IMAGE = Path(__file__).parent / "assets" / "success.png"
@@ -68,13 +80,16 @@ def format_report(report: SearchReport) -> str:
     best, ambiguous = choose_best(report.results)
     results = [best] if best is not None else []
     if not results:
-        text = (
-            "找到了多个证据相当的 X 账号，暂时无法确定最相关来源。可以换原图或更清晰的图片再试。"
-            if report.ambiguous or ambiguous
-            else "本次没有取得可用来源，且有识图引擎未能完成检索，不能据此判断图片没有出处。"
-            if report.errors
-            else "这次没有找到 X/Twitter 的同图出处。可以换原图或更清晰的图片再试。"
-        )
+        if report.ambiguous or ambiguous:
+            text = "找到了多个证据相当的 X 账号，暂时无法确定最相关来源。可以换原图或更清晰的图片再试。"
+        elif report.exact_sources and "source_page" in report.errors:
+            text = "已找到同图页面，但部分来源页面无法读取，暂未取得可用的 X 来源。"
+        elif report.exact_sources:
+            text = "已找到同图页面，但尚未取得可用的 X 来源。"
+        elif report.errors:
+            text = "本次未取得可用的 X 来源，部分检索或来源追查未能完成，不能据此判断图片没有出处。"
+        else:
+            text = "这次没有找到同图结果。可以换原图或更清晰的图片再试。"
     else:
         text = "🎯 靓鸡甄选结果"
         item = results[0]
@@ -86,7 +101,7 @@ def format_report(report: SearchReport) -> str:
             f"来源：{item.url}"
         )
     if not results and report.errors:
-        text += "\n\n未完成的检索：" + "、".join(
+        text += "\n\n未完成的检索或来源追查：" + "、".join(
             f"{engine}（{reason}）" for engine, reason in report.errors.items()
         )
     return text
@@ -111,6 +126,30 @@ class FLJPlugin(Star):
             return None
         api = getattr(metadata.star_cls, "twitter_api", None)
         return api if api is not None and api.is_ready else None
+
+    async def _extract_title_accounts(
+        self, event: AstrMessageEvent, sources: list[dict]
+    ):
+        """Parse source text with the session's provider, without images or history."""
+        provider_id = str(self.config.get("title_llm_provider_id", "") or "").strip()
+        if not provider_id:
+            provider_id = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+        response = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=build_title_prompt(sources),
+            system_prompt=SYSTEM_PROMPT,
+            contexts=[],
+            request_max_retries=1,
+        )
+        candidates = parse_title_candidates(response.completion_text, sources)
+        if self.config.get("log_title_candidates", False):
+            logger.info(
+                "FLJ title candidates (unverified text): %s",
+                format_candidate_diagnostics(candidates, sources),
+            )
+        return candidates
 
     async def _find_image(self, event: AstrMessageEvent) -> Image | None:
         messages = event.get_messages()
@@ -227,10 +266,24 @@ class FLJPlugin(Star):
                 )
                 return
             try:
+                extractor = None
+                if self.config.get("use_title_llm", True) and callable(
+                    getattr(self.context, "llm_generate", None)
+                ):
+
+                    async def extractor(sources):
+                        return await self._extract_title_accounts(event, sources)
+
+                search = (
+                    self.service.search(upload, title_extractor=extractor)
+                    if extractor is not None
+                    else self.service.search(upload)
+                )
                 report = await asyncio.wait_for(
-                    self.service.search(upload),
+                    search,
                     timeout=max(5, int(self.config.get("search_timeout", 30)))
                     + max(5, min(30, int(self.config.get("x_lookup_timeout", 20))))
+                    + (TITLE_LLM_TIMEOUT if extractor is not None else 0)
                     + 10,
                 )
             except TimeoutError:
@@ -242,6 +295,15 @@ class FLJPlugin(Star):
                     event.plain_result("识图暂时失败，请检查插件配置和服务器网络。")
                 )
                 return
+            logger.info(
+                "FLJ search stages: engine_results=%s, exact_sources=%d, "
+                "source_pages=%s, x_candidates=%d, title_llm=%s",
+                report.engine_results,
+                len(report.exact_sources),
+                report.source_pages,
+                report.x_candidate_count,
+                report.title_llm,
+            )
             logger.info(
                 "FLJ search report: results=%d, ambiguous=%s, errors=%s",
                 len(report.results),

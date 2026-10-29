@@ -18,7 +18,7 @@ from io import BytesIO
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
-from httpx2 import AsyncClient
+from httpx2 import AsyncClient, HTTPStatusError
 from PIL import Image, ImageChops, ImageStat, UnidentifiedImageError
 
 _HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
@@ -70,15 +70,20 @@ class XCandidate:
     clue_strength: int = 0
     source_hosts: tuple[str, ...] = ()
     relation_verified: bool = False
+    account_confirmed: bool = False
 
 
 @dataclass
 class RecoveryReport:
     candidates: list[XCandidate] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+    source_pages: dict[str, str] = field(default_factory=dict)
+    title_accounts_checked: int = 0
+    title_accounts_found: int = 0
 
 
 def _merge_candidate(target: XCandidate, incoming: XCandidate) -> None:
+    target.account_confirmed = target.account_confirmed or incoming.account_confirmed
     if incoming.clue_strength > target.clue_strength:
         target.clue_strength = incoming.clue_strength
         target.source_hosts = tuple(dict.fromkeys(incoming.source_hosts))
@@ -431,6 +436,7 @@ async def recover_x(
     search_web: Callable[[str], Awaitable[list[dict]]] | None = None,
     proxy: str | None = None,
     timeout: float = 20,
+    title_candidates: list[dict] | None = None,
 ) -> RecoveryReport:
     report = RecoveryReport()
     clues: list[str] = []
@@ -445,6 +451,7 @@ async def recover_x(
         evidence: str,
         strength: int = 0,
         hosts: tuple[str, ...] = (),
+        account_confirmed: bool = False,
     ) -> None:
         canonical = canonical_x_url(url)
         if not canonical:
@@ -466,6 +473,7 @@ async def recover_x(
                     evidence=evidence,
                     clue_strength=strength,
                     source_hosts=hosts,
+                    account_confirmed=account_confirmed,
                 ),
             )
             return
@@ -492,11 +500,16 @@ async def recover_x(
             if not pool:
                 return
             index = min(
-                pool, key=lambda item: (report.candidates[item].clue_strength, -item)
+                pool,
+                key=lambda item: (
+                    report.candidates[item].clue_strength,
+                    report.candidates[item].account_confirmed,
+                    -item,
+                ),
             )
-            if (
-                not reserve_post_slot
-                and strength <= report.candidates[index].clue_strength
+            if not reserve_post_slot and (strength, account_confirmed) <= (
+                report.candidates[index].clue_strength,
+                report.candidates[index].account_confirmed,
             ):
                 return
             removed = report.candidates.pop(index)
@@ -511,6 +524,7 @@ async def recover_x(
                 evidence=evidence,
                 clue_strength=strength,
                 source_hosts=tuple(dict.fromkeys(hosts)),
+                account_confirmed=account_confirmed,
             )
         )
 
@@ -699,6 +713,52 @@ async def recover_x(
             except Exception:
                 report.errors["x_verify"] = "X 帖子图像核实暂不可用"
 
+    async def query_title_accounts(platform: str) -> None:
+        if twitter_api is not None and getattr(twitter_api, "is_ready", False):
+            for item in (title_candidates or [])[:3]:
+                if item.get("platform") != platform:
+                    continue
+                handle = str(item.get("handle") or "")
+                url = canonical_x_url(f"https://x.com/{handle}")
+                if not url:
+                    continue
+                report.title_accounts_checked += 1
+                try:
+                    profile = await asyncio.wait_for(
+                        twitter_api.get_user_info(handle), timeout=3
+                    )
+                    if (
+                        not isinstance(profile, dict)
+                        or not profile.get("status")
+                        or str(profile.get("user_name") or "").lstrip("@").casefold()
+                        != handle.casefold()
+                    ):
+                        continue
+                    report.title_accounts_found += 1
+                    host = _source_host(str(item.get("source_url") or ""))
+                    add(
+                        url,
+                        "",
+                        "来源文字明示的 X 账号，已查询存在（同图未确认）"
+                        if platform == "X"
+                        else "来源文字的平台未确定候选，已查询到同名 X 账号（同图未确认）",
+                        strength=1 if platform == "X" else 0,
+                        hosts=(host,) if host else (),
+                        account_confirmed=True,
+                    )
+                    candidate = next(
+                        (
+                            c
+                            for c in report.candidates
+                            if c.url.casefold() == url.casefold()
+                        ),
+                        None,
+                    )
+                    if candidate is not None:
+                        candidate.name = str(profile.get("screen_name") or "")[:100]
+                except Exception:
+                    report.errors["title_account"] = "部分文字候选账号查询未完成"
+
     try:
         async with asyncio.timeout(max(0.01, timeout)):
             for source in sources[:10]:
@@ -717,6 +777,7 @@ async def recover_x(
                         strength=2 if "/status/" in str(source.get("url") or "") else 1,
                         hosts=(host,) if host else (),
                     )
+            await query_title_accounts("X")
             async with AsyncClient(
                 proxy=proxy, trust_env=False, timeout=5, follow_redirects=False
             ) as client:
@@ -746,11 +807,13 @@ async def recover_x(
                         if len(fetched_hosts) >= 3:
                             break
                         fetched_hosts.add(host)
+                        report.source_pages[host] = "started"
                         try:
                             previous_urls = {
                                 candidate.url for candidate in report.candidates
                             }
                             html = await _fetch_page(client, str(source["url"]))
+                            report.source_pages[host] = "read" if html else "empty"
                             page = _Page()
                             page.feed(html)
                             for href, _ in page.links[:500]:
@@ -787,13 +850,25 @@ async def recover_x(
                                 for candidate in report.candidates
                             ):
                                 break
-                        except Exception:
+                        except Exception as exc:
+                            report.source_pages[host] = (
+                                f"HTTP {exc.response.status_code}"
+                                if isinstance(exc, HTTPStatusError)
+                                else type(exc).__name__
+                            )
                             report.errors["source_page"] = (
                                 "部分精确匹配来源页面无法读取"
                             )
                     await keyword_search(client, queried)
                     await verify()
+                if not any(candidate.verified for candidate in report.candidates):
+                    await query_title_accounts("unknown")
+                    await verify()
     except TimeoutError:
+        report.source_pages = {
+            host: "timeout" if status == "started" else status
+            for host, status in report.source_pages.items()
+        }
         report.errors["x_recovery"] = "X 线索查找超时"
     unique: dict[str, XCandidate] = {}
     for candidate in report.candidates:

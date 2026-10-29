@@ -30,6 +30,24 @@
     "secret": true,
     "hint": "填写后，google_lens 只查完全匹配。没有 X 来源时追查账号线索，最多追加两次限 X/Twitter 域名的网页搜索；一次找图最多三次 API 搜索，额度和计费以服务商为准。"
   },
+  "use_title_llm": {
+    "description": "使用 LLM 解析来源标题文字",
+    "type": "bool",
+    "default": true,
+    "hint": "没有直接 X 同图来源时，最多分析6个来源的标题、站点及链接，返回3个带原文依据的候选；优先检索明确的X线索，仍无同图来源时也查询unknown候选。每次最多一次LLM请求，超时后继续规则检索，不发送图片或聊天历史。"
+  },
+  "log_title_candidates": {
+    "description": "记录标题候选原文片段（诊断用）",
+    "type": "bool",
+    "default": false,
+    "hint": "记录最多3个候选的账号字符串、平台判定、置信度、来源标题及依据片段；均为未核实文字，不代表身份或图片归属。完整链接和常见凭据字段会隐藏。排查完成可关闭。"
+  },
+  "title_llm_provider_id": {
+    "description": "标题解析使用的模型提供商 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用当前会话的聊天模型；也可填写AstrBot已配置的文本模型提供商ID，无需额外填写Key。"
+  },
   "x_lookup_timeout": {
     "description": "未找到 X 来源时的线索追查上限（秒）",
     "type": "int",

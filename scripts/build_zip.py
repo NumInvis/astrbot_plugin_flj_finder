@@ -11,6 +11,7 @@ files = [
     "search.py",
     "google_api.py",
     "x_recovery.py",
+    "title_llm.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",

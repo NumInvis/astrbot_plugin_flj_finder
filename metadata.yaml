@@ -1,7 +1,7 @@
 name: astrbot_plugin_flj_finder
 display_name: 靓鸡甄选
 desc: 图片完全匹配检索，仅返回 X/Twitter；无直链时从匹配页面追查账号与推文来源。
-version: v0.4.1
+version: v0.4.3
 author: FLJ Contributors
 repo: https://github.com/Ars1027/astrbot_plugin_flj_finder
 astrbot_version: ">=4.28.0,<5"

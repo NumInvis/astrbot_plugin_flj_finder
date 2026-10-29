@@ -6,12 +6,13 @@ import asyncio
 import ipaddress
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
+from httpx2 import AsyncClient
 from PicImageSearch import Ascii2D, BaiDu, GoogleLens, Network, SauceNAO
 from pyquery import PyQuery
 
@@ -33,6 +34,7 @@ else:
     )
 
 UNKNOWN_ACCOUNT = "未提供"
+TITLE_LLM_TIMEOUT = 30
 logger = logging.getLogger(__name__)
 _ENGINES = ("google_lens", "baidu", "ascii2d", "saucenao")
 _X_HOSTS = {
@@ -88,6 +90,9 @@ class SearchResult:
     source_hosts: tuple[str, ...] = ()
     relation_verified: bool = False
     selection_reason: str = ""
+    source: str = ""
+    account_confirmed: bool = False
+    followers: int | None = None
 
 
 @dataclass
@@ -95,6 +100,12 @@ class SearchReport:
     results: list[SearchResult] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
     ambiguous: bool = False
+    # Exact image-match pages are metadata, separate from selected X sources.
+    exact_sources: list[SearchResult] = field(default_factory=list)
+    engine_results: dict[str, int] = field(default_factory=dict)
+    source_pages: dict[str, str] = field(default_factory=dict)
+    x_candidate_count: int = 0
+    title_llm: dict[str, str | int] = field(default_factory=dict)
 
 
 class _EngineUnavailable(RuntimeError):
@@ -248,10 +259,31 @@ def choose_best(results: list[SearchResult]) -> tuple[SearchResult | None, bool]
     groups: dict[str, list[SearchResult]] = {}
     for item in candidates:
         account = _platform_account(item.url)[1]
-        if item.clue_strength > 0 and account.startswith("@"):
+        if (item.clue_strength > 0 or item.account_confirmed) and account.startswith(
+            "@"
+        ):
             groups.setdefault(account.casefold(), []).append(item)
     if not groups:
         return None, False
+    counted = [
+        item
+        for items in groups.values()
+        for item in items
+        if item.followers is not None
+    ]
+    if counted:
+        best = max(
+            counted,
+            key=lambda item: (
+                item.followers,
+                item.clue_strength,
+                len(set(item.source_hosts)),
+            ),
+        )
+        return replace(
+            best,
+            selection_reason=f"未确认同图；在已取得关注者数的候选中最多（{best.followers:,}）",
+        ), False
     ranked = []
     for items in groups.values():
         strength = max(item.clue_strength for item in items)
@@ -279,6 +311,7 @@ def choose_best(results: list[SearchResult]) -> tuple[SearchResult | None, bool]
         return None, True
     best = ranked[0][1]
     reason = {
+        0: "来源文字候选在 X 存在同名账号，尚未确认同图",
         3: "同图来源明确署名的账号，尚未确认同图",
         2: "同图来源直接提供的帖子链接，尚未确认同图",
     }.get(best.clue_strength, "同图来源明确提及的账号，尚未确认同图")
@@ -321,6 +354,8 @@ def _merge_result(first: SearchResult, second: SearchResult) -> SearchResult:
         url=url,
         clue_strength=strength,
         source_hosts=hosts,
+        account_confirmed=first.account_confirmed or second.account_confirmed,
+        followers=winner.followers if winner.followers is not None else other.followers,
     )
 
 
@@ -341,10 +376,11 @@ def _make_result(
         account=account,
         name=str(getattr(item, "author", "") or "")[:100],
         url=url,
-        title=str(getattr(item, "title", "") or "")[:300],
+        title=str(getattr(item, "title", "") or "")[:4096],
         engine=engine,
         match_type=match_type,
         verified=match_type == "exact",
+        source=str(getattr(item, "source", "") or "")[:120],
     )
 
 
@@ -446,7 +482,9 @@ class SearchService:
                 results = []
                 for item in payload.get("exact_matches", []):
                     result = _make_result(
-                        SimpleNamespace(title=item.get("title", "")),
+                        SimpleNamespace(
+                            title=item.get("title", ""), source=item.get("source", "")
+                        ),
                         item.get("link", ""),
                         engine,
                         "exact",
@@ -624,7 +662,11 @@ class SearchService:
             pass
         return result
 
-    async def search(self, image: bytes) -> SearchReport:
+    async def search(
+        self,
+        image: bytes,
+        title_extractor: Callable[[list[dict]], Awaitable[list[dict]]] | None = None,
+    ) -> SearchReport:
         report = SearchReport()
         if not image:
             report.errors["image"] = "图片内容为空"
@@ -647,6 +689,7 @@ class SearchService:
         collected = await asyncio.gather(*(run(engine) for engine in self.engines))
         unique: dict[str, SearchResult] = {}
         for engine, results, error in collected:
+            report.engine_results[engine] = len(results)
             if error:
                 report.errors[engine] = error
             for result in results:
@@ -654,6 +697,7 @@ class SearchService:
                 unique[key] = (
                     _merge_result(unique[key], result) if key in unique else result
                 )
+        report.exact_sources = [item for item in unique.values() if item.verified]
         exact_sources = [
             {"url": item.url, "title": item.title}
             for item in unique.values()
@@ -708,9 +752,35 @@ class SearchService:
                 if host not in source_hosts:
                     source_hosts.add(host)
                     sources.append({"url": item.url, "title": item.title})
+                    if item.source:
+                        sources[-1]["source"] = item.source
                     if len(sources) == 6:
                         break
             if sources:
+                title_candidates = []
+                if title_extractor is not None:
+                    try:
+                        extracted = await asyncio.wait_for(
+                            title_extractor(sources), TITLE_LLM_TIMEOUT
+                        )
+                        title_candidates = [
+                            item
+                            for item in extracted
+                            if item["platform"] in {"X", "unknown"}
+                        ][:3]
+                        report.title_llm = {
+                            "status": "completed",
+                            "returned": len(extracted),
+                            "eligible": len(title_candidates),
+                            "unknown": sum(
+                                item["platform"] == "unknown" for item in extracted
+                            ),
+                        }
+                    except Exception as exc:
+                        report.title_llm = {"status": type(exc).__name__}
+                        report.errors["title_llm"] = (
+                            "标题文字分析未完成，已继续规则检索"
+                        )
                 queries = 0
 
                 async def search_web(query):
@@ -736,12 +806,23 @@ class SearchService:
                             search_web if self.serpapi_api_key else None,
                             self.proxy,
                             self.x_lookup_timeout,
+                            **(
+                                {"title_candidates": title_candidates}
+                                if title_candidates
+                                else {}
+                            ),
                         ),
                         # Recovery returns its partial clues when its own budget
                         # expires; leave time to close its client and return them.
                         timeout=self.x_lookup_timeout + 1,
                     )
                     report.errors.update(recovery.errors)
+                    report.source_pages.update(recovery.source_pages)
+                    if title_extractor is not None:
+                        report.title_llm.update(
+                            checked=recovery.title_accounts_checked,
+                            found=recovery.title_accounts_found,
+                        )
                     for candidate in recovery.candidates:
                         result = _make_result(
                             SimpleNamespace(title=candidate.title),
@@ -759,6 +840,7 @@ class SearchService:
                                     clue_strength=candidate.clue_strength,
                                     source_hosts=candidate.source_hosts,
                                     relation_verified=candidate.relation_verified,
+                                    account_confirmed=candidate.account_confirmed,
                                 )
                             )
                 except TimeoutError:
@@ -785,11 +867,92 @@ class SearchService:
             merged[key] = (
                 _merge_result(merged[key], result) if key in merged else result
             )
+        report.x_candidate_count = len(merged)
+        if not any(item.verified for item in merged.values()):
+            accounts = list(
+                dict.fromkeys(
+                    _platform_account(item.url)[1].casefold()
+                    for item in merged.values()
+                    if item.clue_strength > 0 or item.account_confirmed
+                )
+            )
+            accounts = [account for account in accounts if account.startswith("@")]
+            if len(accounts) > 1:
+                counts = dict(
+                    zip(
+                        accounts,
+                        await asyncio.gather(
+                            *(
+                                self._account_followers(account[1:])
+                                for account in accounts
+                            )
+                        ),
+                        strict=True,
+                    )
+                )
+                logger.info("FLJ candidate followers: %s", counts)
+                merged = {
+                    key: replace(
+                        item,
+                        followers=counts.get(_platform_account(item.url)[1].casefold()),
+                    )
+                    for key, item in merged.items()
+                }
         best, report.ambiguous = choose_best(list(merged.values()))
         if best is not None:
             best = await self._profile_name(best)
         report.results = [best] if best is not None else []
         return report
+
+    async def _account_followers(self, handle: str) -> int | None:
+        """Read candidate popularity without treating it as image evidence."""
+
+        def count(value):
+            if type(value) is int:
+                return value if value >= 0 else None
+            if isinstance(value, str) and re.fullmatch(
+                r"[0-9][0-9,\s]*", value.strip()
+            ):
+                return int(re.sub(r"[,\s]", "", value))
+            return None
+
+        try:
+            api = self.twitter_api_provider() if self.twitter_api_provider else None
+            if api is None:
+                return None
+            profile = await asyncio.wait_for(api.get_user_info(handle), timeout=3)
+            if (
+                not isinstance(profile, dict)
+                or not profile.get("status")
+                or str(profile.get("user_name") or "").lstrip("@").casefold()
+                != handle.casefold()
+            ):
+                return None
+            for key in ("followers", "followers_count"):
+                value = count(profile.get(key))
+                if value is not None:
+                    return value
+            nitter = str(getattr(api, "nitter_url", "") or "").rstrip("/")
+            if nitter:
+                # Nitter's origin comes from the Twitter plugin's configuration.
+                async with AsyncClient(
+                    proxy=getattr(api, "proxy", None) or self.proxy,
+                    trust_env=False,
+                    timeout=4,
+                    follow_redirects=False,
+                ) as client:
+                    async with asyncio.timeout(4):
+                        response = await client.get(nitter + "/" + handle)
+                        response.raise_for_status()
+                page = PyQuery(response.text)
+                return count(
+                    page(".profile-statlist .followers .profile-stat-num").text()
+                )
+        except Exception as exc:
+            logger.warning(
+                "FLJ follower lookup failed for @%s: %s", handle, type(exc).__name__
+            )
+        return None
 
     async def _profile_name(self, result: SearchResult) -> SearchResult:
         """Fill a selected account's display name without changing its evidence."""

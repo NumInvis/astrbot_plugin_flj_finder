@@ -125,6 +125,164 @@ class UrlTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_explicit_account_is_queried_but_not_marked_same_image(self):
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                return_value={
+                    "status": True,
+                    "user_name": "sample_01",
+                    "screen_name": "Sample",
+                }
+            ),
+        )
+        report = await recover_x(
+            picture(),
+            [{"url": "https://source.example/photo", "title": "X ID: sample_01"}],
+            twitter_api=api,
+            title_candidates=[
+                {
+                    "handle": "sample_01",
+                    "platform": "X",
+                    "source_url": "https://source.example/photo",
+                },
+            ],
+        )
+        api.get_user_info.assert_awaited_once_with("sample_01")
+        self.assertEqual(report.title_accounts_checked, 1)
+        self.assertEqual(report.title_accounts_found, 1)
+        self.assertEqual(report.candidates[0].name, "Sample")
+        self.assertFalse(report.candidates[0].verified)
+        self.assertEqual(report.candidates[0].clue_strength, 1)
+
+    async def test_unknown_accounts_are_queried_after_explicit_clues_fail(self):
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                side_effect=[
+                    {"status": False},
+                    {"status": True, "user_name": "alias", "screen_name": "Alias"},
+                ]
+            ),
+        )
+        report = await recover_x(
+            picture(),
+            [{"url": "https://source.example/photo", "title": "alias"}],
+            twitter_api=api,
+            title_candidates=[
+                {"handle": "alias", "platform": "unknown"},
+                {"handle": "explicit", "platform": "X"},
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in api.get_user_info.await_args_list],
+            ["explicit", "alias"],
+        )
+        self.assertEqual(report.title_accounts_checked, 2)
+        self.assertEqual(report.title_accounts_found, 1)
+        self.assertEqual(report.candidates[0].account, "@alias")
+        self.assertFalse(report.candidates[0].verified)
+        self.assertEqual(report.candidates[0].clue_strength, 0)
+        self.assertIn("平台未确定", report.candidates[0].evidence)
+
+    async def test_verified_source_skips_unknown_account_fallback(self):
+        source = picture()
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(),
+            get_tweet=AsyncMock(
+                return_value={
+                    "status": True,
+                    "username": "artist",
+                    "tweet_id": "123",
+                    "images": ["https://pbs.twimg.com/media/original.png"],
+                }
+            ),
+            download_media=AsyncMock(return_value=source),
+        )
+        report = await recover_x(
+            source,
+            [{"url": "https://x.com/artist/status/123"}],
+            twitter_api=api,
+            title_candidates=[{"handle": "alias", "platform": "unknown"}],
+        )
+        self.assertTrue(report.candidates[0].verified)
+        api.get_user_info.assert_not_awaited()
+
+    async def test_unknown_profile_mismatch_is_not_added(self):
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                return_value={"status": True, "user_name": "different"}
+            ),
+        )
+        report = await recover_x(
+            picture(),
+            [],
+            twitter_api=api,
+            title_candidates=[{"handle": "alias", "platform": "unknown"}],
+        )
+        api.get_user_info.assert_awaited_once_with("alias")
+        self.assertEqual(report.candidates, [])
+        self.assertEqual(report.title_accounts_found, 0)
+
+    async def test_unknown_account_timeline_can_supply_verified_image(self):
+        source = picture()
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                return_value={"status": True, "user_name": "alias"}
+            ),
+            get_user_timeline_items=AsyncMock(
+                return_value=[{"tweet_id": "123", "username": "alias"}]
+            ),
+            get_tweet=AsyncMock(
+                return_value={
+                    "status": True,
+                    "tweet_id": "123",
+                    "username": "alias",
+                    "images": ["https://pbs.twimg.com/media/original.png"],
+                }
+            ),
+            download_media=AsyncMock(return_value=source),
+        )
+        report = await recover_x(
+            source,
+            [{"url": "https://source.example/photo", "title": "alias"}],
+            twitter_api=api,
+            title_candidates=[{"handle": "alias", "platform": "unknown"}],
+        )
+        api.get_user_info.assert_awaited_once_with("alias")
+        api.get_user_timeline_items.assert_awaited_once_with(
+            "alias", since_id="", limit=3
+        )
+        self.assertTrue(
+            any(
+                candidate.verified and candidate.url == "https://x.com/alias/status/123"
+                for candidate in report.candidates
+            )
+        )
+
+    async def test_llm_profile_mismatch_does_not_create_an_account_result(self):
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                return_value={
+                    "status": True,
+                    "user_name": "different",
+                    "screen_name": "Wrong",
+                }
+            ),
+        )
+        report = await recover_x(
+            picture(),
+            [],
+            twitter_api=api,
+            title_candidates=[{"handle": "sample_01", "platform": "X"}],
+        )
+        self.assertEqual(report.candidates, [])
+        self.assertEqual(report.title_accounts_found, 0)
+
     def setUp(self):
         # Recovery tests never make live source-page requests. Boundary tests
         # exercise the actual fetcher separately with MockTransport.
@@ -308,6 +466,48 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             collect_account_clues(sources)["artist"], (3, ("source.example",))
         )
+
+    async def test_403_records_status_and_continues_to_read_other_sources(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.url.host == "blocked.example":
+                return httpx2.Response(403, text="PRIVATE_RESPONSE_SENTINEL")
+            return httpx2.Response(200, text="<p>A landscape photograph</p>")
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        with (
+            patch("x_recovery._fetch_page", _fetch_page),
+            patch("x_recovery._public_url", AsyncMock(return_value=True)),
+            patch("x_recovery.AsyncClient", return_value=client),
+        ):
+            report = await recover_x(
+                picture(),
+                [
+                    {"url": "https://blocked.example/private?token=TOKEN_SENTINEL"},
+                    {"url": "https://readable.example/photo"},
+                ],
+            )
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            report.source_pages,
+            {"blocked.example": "HTTP 403", "readable.example": "read"},
+        )
+        self.assertEqual(report.candidates, [])
+        self.assertEqual(report.errors, {"source_page": "部分精确匹配来源页面无法读取"})
+        self.assertNotIn("SENTINEL", repr(report))
+
+    async def test_source_failure_does_not_record_exception_body(self):
+        with patch(
+            "x_recovery._fetch_page",
+            AsyncMock(side_effect=ValueError("SECRET_SENTINEL")),
+        ):
+            report = await recover_x(
+                picture(), [{"url": "https://blocked.example/private"}]
+            )
+        self.assertEqual(report.source_pages, {"blocked.example": "ValueError"})
+        self.assertNotIn("SECRET_SENTINEL", repr(report))
 
     async def test_no_x_or_clue_returns_empty_without_fabricating_account(self):
         with patch(

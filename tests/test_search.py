@@ -121,6 +121,165 @@ class ParserTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_account_survives_full_keyword_pool_and_final_selection(self):
+        api = SimpleNamespace(
+            is_ready=True,
+            get_user_info=AsyncMock(
+                return_value={
+                    "status": True,
+                    "user_name": "alias",
+                    "screen_name": "Alias",
+                }
+            ),
+            get_tweet=AsyncMock(return_value={"status": False}),
+        )
+        service = SearchService(
+            {"engines": ["google_lens"], "serpapi_api_key": "test-key"},
+            twitter_api_provider=lambda: api,
+        )
+        service._search_engine = AsyncMock(
+            return_value=[
+                SearchResult(
+                    url="https://source.example/photo",
+                    title="alias - Gallery",
+                    verified=True,
+                )
+            ]
+        )
+        extractor = AsyncMock(
+            return_value=[
+                {
+                    "handle": "alias",
+                    "platform": "unknown",
+                    "source_url": "https://source.example/photo",
+                }
+            ]
+        )
+        with (
+            patch("x_recovery._fetch_page", AsyncMock(return_value="")),
+            patch(
+                "search.search_x_serpapi",
+                AsyncMock(
+                    return_value=[
+                        {"link": f"https://x.com/random{index}/status/{100 + index}"}
+                        for index in range(8)
+                    ]
+                ),
+            ),
+        ):
+            report = await service.search(b"image", title_extractor=extractor)
+        self.assertEqual(report.x_candidate_count, 8)
+        self.assertEqual(report.title_llm["checked"], 1)
+        self.assertEqual(report.title_llm["found"], 1)
+        self.assertEqual(len(report.results), 1)
+        self.assertEqual(report.results[0].account, "@alias")
+        self.assertTrue(report.results[0].account_confirmed)
+        self.assertFalse(report.results[0].verified)
+        self.assertEqual(report.results[0].clue_strength, 0)
+
+    async def test_llm_metadata_includes_unknown_platform_for_recovery_fallback(self):
+        service = SearchService({"engines": ["google_lens"]})
+        service._search_engine = AsyncMock(
+            return_value=[
+                SearchResult(
+                    url="https://source.example/photo",
+                    title="X ID: sample_01",
+                    source="Example",
+                    verified=True,
+                )
+            ]
+        )
+        valid = {"handle": "sample_01", "platform": "X"}
+        unknown = {"handle": "alias", "platform": "unknown"}
+        extractor = AsyncMock(return_value=[valid, unknown])
+        recovery = RecoveryReport(title_accounts_checked=1, title_accounts_found=1)
+        with patch("search.recover_x", AsyncMock(return_value=recovery)) as recover:
+            report = await service.search(b"image", title_extractor=extractor)
+        self.assertEqual(extractor.await_args.args[0][0]["source"], "Example")
+        self.assertEqual(
+            recover.await_args.kwargs["title_candidates"], [valid, unknown]
+        )
+        self.assertEqual(
+            report.title_llm,
+            {
+                "status": "completed",
+                "returned": 2,
+                "eligible": 2,
+                "unknown": 1,
+                "checked": 1,
+                "found": 1,
+            },
+        )
+
+    async def test_llm_failure_falls_back_to_rules_without_logging_response(self):
+        service = SearchService({"engines": ["google_lens"]})
+        service._search_engine = AsyncMock(
+            return_value=[
+                SearchResult(
+                    url="https://source.example/photo",
+                    verified=True,
+                )
+            ]
+        )
+        with patch(
+            "search.recover_x", AsyncMock(return_value=RecoveryReport())
+        ) as recover:
+            report = await service.search(
+                b"image",
+                title_extractor=AsyncMock(side_effect=ValueError("SECRET_SENTINEL")),
+            )
+        recover.assert_awaited_once()
+        self.assertNotIn("title_candidates", recover.await_args.kwargs)
+        self.assertEqual(report.title_llm["status"], "ValueError")
+        self.assertNotIn("SECRET_SENTINEL", repr(report))
+
+    async def test_direct_x_match_does_not_spend_llm_request(self):
+        service = SearchService({"engines": ["google_lens"]})
+        service._search_engine = AsyncMock(
+            return_value=[
+                SearchResult(
+                    platform="X",
+                    url="https://x.com/sample/status/123",
+                    verified=True,
+                )
+            ]
+        )
+        service._source_account = AsyncMock(side_effect=lambda result, *args: result)
+        extractor = AsyncMock()
+        await service.search(b"image", title_extractor=extractor)
+        extractor.assert_not_awaited()
+
+    async def test_blocked_page_retains_exact_metadata_and_stage_counts(self):
+        service = SearchService({"engines": ["google_lens"]})
+        source = SearchResult(
+            url="https://source.example/photo",
+            title="A landscape photograph",
+            verified=True,
+        )
+        service._search_engine = AsyncMock(return_value=[source])
+        recovery = RecoveryReport(
+            errors={"source_page": "部分精确匹配来源页面无法读取"},
+            source_pages={"source.example": "HTTP 403"},
+        )
+        with patch("search.recover_x", AsyncMock(return_value=recovery)):
+            report = await service.search(b"image")
+        self.assertEqual(report.results, [])
+        self.assertEqual(report.exact_sources, [source])
+        self.assertEqual(report.engine_results, {"google_lens": 1})
+        self.assertEqual(report.source_pages, {"source.example": "HTTP 403"})
+        self.assertEqual(report.x_candidate_count, 0)
+
+    async def test_empty_engine_records_zero_without_fabricating_sources(self):
+        service = SearchService({"engines": ["google_lens"]})
+        service._search_engine = AsyncMock(return_value=[])
+        with patch("search.recover_x", AsyncMock()) as recover:
+            report = await service.search(b"image")
+        recover.assert_not_awaited()
+        self.assertEqual(report.engine_results, {"google_lens": 0})
+        self.assertEqual(report.exact_sources, [])
+        self.assertEqual(report.source_pages, {})
+        self.assertEqual(report.errors, {})
+
     async def test_exact_x_skips_recovery_and_non_x_is_never_returned(self):
         service = SearchService({"engines": ["google_lens"]})
         service._search_engine = AsyncMock(

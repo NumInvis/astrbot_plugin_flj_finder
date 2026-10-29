@@ -71,6 +71,25 @@ def test_equal_account_clues_are_ambiguous_and_never_forced_by_search_order():
         assert choose_best(items) == (None, True)
 
 
+def test_confirmed_unknown_account_is_a_fallback_but_keyword_hits_are_not():
+    unknown = SearchResult(
+        platform="X",
+        account="@alias",
+        url="https://x.com/alias",
+        account_confirmed=True,
+    )
+    keyword = post("random")
+    assert choose_best([keyword]) == (None, False)
+    best, ambiguous = choose_best([keyword, unknown])
+    assert best.account == "@alias" and not best.verified and not ambiguous
+    assert "同名账号" in best.selection_reason
+    assert "尚未确认同图" in best.selection_reason
+    explicit = post("explicit", clue_strength=1)
+    assert choose_best([unknown, explicit])[0].account == "@explicit"
+    another = replace(unknown, account="@another", url="https://x.com/another")
+    assert choose_best([unknown, another]) == (None, True)
+
+
 def test_more_distinct_sources_can_resolve_clue_tie_without_duplicate_votes():
     first = post("one", clue_strength=2, source_hosts=("a.example", "a.example"))
     second = post("two", clue_strength=2, source_hosts=("b.example", "c.example"))
