@@ -114,9 +114,9 @@ def _matches(payload: dict[str, Any], kind: str) -> list[dict[str, Any]]:
 
 
 async def search_serpapi(
-    image: bytes, api_key: str, timeout: float, proxy: str | None
+    image: bytes, api_key: str, timeout: float, proxy: str | None, visual: bool = False
 ) -> dict[str, Any]:
-    """Upload once and request only the Google Lens exact-match section."""
+    """Upload once, then request exact matches and optionally similar images."""
     if not api_key.strip():
         raise GoogleAPIError("未配置 SerpApi API Key")
     if not image:
@@ -159,7 +159,25 @@ async def search_serpapi(
                     params=params,
                 )
             )
-            return {"exact_matches": _matches(payload, "exact_matches")}
+            result: dict[str, Any] = {
+                "exact_matches": _matches(payload, "exact_matches")
+            }
+            if visual:
+                # Similar images are extra leads, so a failed second call must
+                # never discard the exact matches already retrieved.
+                try:
+                    visual_payload = _response_json(
+                        await client.get(
+                            "https://serpapi.com/search.json",
+                            params={**params, "type": "visual_matches"},
+                        )
+                    )
+                    result["visual_matches"] = _matches(
+                        visual_payload, "visual_matches"
+                    )
+                except GoogleAPIError:
+                    result["visual_matches"] = []
+            return result
     except TimeoutException:
         raise GoogleAPIError("SerpApi 请求超时") from None
     except RequestError:

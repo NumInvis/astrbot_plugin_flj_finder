@@ -14,8 +14,8 @@
   "engines": {
     "description": "启用的识图引擎",
     "type": "list",
-    "default": ["google_lens", "baidu", "ascii2d"],
-    "hint": "可选 google_lens、baidu、ascii2d、saucenao；配置 SauceNAO Key 后会自动加入 SauceNAO。"
+    "default": ["google_lens", "baidu", "copyseeker", "yandex"],
+    "hint": "可选 google_lens、baidu、copyseeker、yandex、ascii2d、saucenao；配置 SauceNAO Key 后会自动加入 SauceNAO。copyseeker 会直接列出包含原图的页面，yandex 只作为相似图线索。"
   },
   "proxy": {
     "description": "识图引擎代理",
@@ -29,6 +29,12 @@
     "default": "",
     "secret": true,
     "hint": "填写后，google_lens 只查完全匹配。没有 X 来源时追查账号线索，最多追加两次限 X/Twitter 域名的网页搜索；一次找图最多三次 API 搜索，额度和计费以服务商为准。"
+  },
+  "serpapi_visual_matches": {
+    "description": "同时请求 Google Lens 相似图（使用 SerpApi 额度）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后每次找图会多请求一次 Google Lens 相似图接口，用于没有任何同图页面时继续追查 X 账号；相似图只作为待核实线索，不会当作同图证据。关闭可节省一半 SerpApi 额度。"
   },
   "use_title_llm": {
     "description": "使用 LLM 解析来源标题文字",

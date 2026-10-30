@@ -13,7 +13,15 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 from httpx2 import AsyncClient
-from PicImageSearch import Ascii2D, BaiDu, GoogleLens, Network, SauceNAO
+from PicImageSearch import (
+    Ascii2D,
+    BaiDu,
+    Copyseeker,
+    GoogleLens,
+    Network,
+    SauceNAO,
+    Yandex,
+)
 from pyquery import PyQuery
 
 if __package__:
@@ -36,7 +44,9 @@ else:
 UNKNOWN_ACCOUNT = "未提供"
 TITLE_LLM_TIMEOUT = 30
 logger = logging.getLogger(__name__)
-_ENGINES = ("google_lens", "baidu", "ascii2d", "saucenao")
+_ENGINES = ("google_lens", "baidu", "copyseeker", "yandex", "ascii2d", "saucenao")
+# Engines that only return visually similar pages: their results are leads, never proof.
+_CLUE_ENGINES = {"yandex"}
 _X_HOSTS = {
     "x.com",
     "www.x.com",
@@ -460,11 +470,12 @@ class SearchService:
             self.engines.append("saucenao")
         self.proxy = str(config.get("proxy", "") or "").strip() or None
         self.timeout = max(1.0, float(config.get("search_timeout", 25)))
+        self.visual_matches = bool(config.get("serpapi_visual_matches", False))
         self.x_lookup_timeout = max(
             5, min(30, float(config.get("x_lookup_timeout", 20)))
         )
         self.twitter_api_provider = twitter_api_provider
-        self._semaphore = asyncio.Semaphore(3)
+        self._semaphore = asyncio.Semaphore(4)
 
     async def _search_engine(self, engine: str, image: bytes) -> list[SearchResult]:
         if engine not in _ENGINES:
@@ -474,23 +485,29 @@ class SearchService:
         async with self._semaphore:
             if engine == "google_lens" and self.serpapi_api_key:
                 try:
+                    visual = {"visual": True} if self.visual_matches else {}
                     payload = await search_serpapi(
-                        image, self.serpapi_api_key, self.timeout, self.proxy
+                        image, self.serpapi_api_key, self.timeout, self.proxy, **visual
                     )
                 except GoogleAPIError as exc:
                     raise _EngineUnavailable(str(exc)) from exc
                 results = []
-                for item in payload.get("exact_matches", []):
-                    result = _make_result(
-                        SimpleNamespace(
-                            title=item.get("title", ""), source=item.get("source", "")
-                        ),
-                        item.get("link", ""),
-                        engine,
-                        "exact",
-                    )
-                    if result:
-                        results.append(result)
+                for kind, match_type in (
+                    ("exact_matches", "exact"),
+                    ("visual_matches", "visual"),
+                ):
+                    for item in payload.get(kind, []):
+                        result = _make_result(
+                            SimpleNamespace(
+                                title=item.get("title", ""),
+                                source=item.get("source", ""),
+                            ),
+                            item.get("link", ""),
+                            engine,
+                            match_type,
+                        )
+                        if result:
+                            results.append(result)
                 return results
             async with Network(proxies=self.proxy, timeout=self.timeout) as client:
                 client.event_hooks["response"].append(_check_response)
@@ -502,6 +519,20 @@ class SearchService:
                 if engine == "baidu":
                     return parse_results(
                         await BaiDu(client=client).search(file=image), engine
+                    )
+                if engine == "copyseeker":
+                    # Copyseeker only lists pages that contain this exact image.
+                    return parse_results(
+                        await Copyseeker(client=client).search(file=image),
+                        engine,
+                        "exact",
+                    )
+                if engine == "yandex":
+                    return parse_results(
+                        await Yandex(
+                            base_url="https://yandex.ru", client=client
+                        ).search(file=image),
+                        engine,
                     )
                 if engine == "ascii2d":
                     return parse_results(
@@ -616,7 +647,7 @@ class SearchService:
             return result
         try:
             async with Network(
-                proxies=self.proxy, timeout=min(6, self.timeout)
+                proxies=self.proxy, timeout=min(4, self.timeout)
             ) as client:
                 response = await client.get(
                     endpoint,
@@ -644,7 +675,6 @@ class SearchService:
                             clue_strength=result.clue_strength if same_author else 0,
                             source_hosts=result.source_hosts if same_author else (),
                         )
-                    return result
                 data = payload.get("data", {}) if payload.get("code") == 0 else {}
                 owner = data.get("owner", {}) if kind == "video" else data
                 mid = str(owner.get("mid", ""))
@@ -660,7 +690,49 @@ class SearchService:
         except Exception:
             # Missing account metadata must not discard an otherwise usable source.
             pass
+        if kind == "x" and not result.name:
+            result = await self._x_author_fallback(result, status[1])
         return result
+
+    async def _x_author_fallback(
+        self, result: SearchResult, status_id: str
+    ) -> SearchResult:
+        """Read a public post's author from fxTwitter when X's own endpoint fails."""
+        try:
+            async with Network(
+                proxies=self.proxy, timeout=min(5, self.timeout)
+            ) as client:
+                response = await client.get(
+                    f"https://api.fxtwitter.com/2/status/{status_id}",
+                    follow_redirects=False,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            return result
+        author = payload.get("author") if isinstance(payload, dict) else None
+        if not isinstance(author, dict):
+            return result
+        handle = str(author.get("screen_name") or "").lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+            return result
+        name = str(author.get("name") or "").strip()[:100]
+        followers = author.get("followers")
+        if type(followers) is not int or followers < 0:
+            followers = None
+        same_author = (
+            _platform_account(result.url)[1].casefold() == f"@{handle}".casefold()
+        )
+        return replace(
+            result,
+            account=f"@{handle}",
+            name=name or result.name,
+            url=canonical_x_url(f"https://x.com/{handle}/status/{status_id}")
+            or result.url,
+            clue_strength=result.clue_strength if same_author else 0,
+            source_hosts=result.source_hosts if same_author else (),
+            followers=followers,
+        )
 
     async def search(
         self,
@@ -728,6 +800,39 @@ class SearchService:
             for item in unique.values()
             if item.platform == "X" and item.verified
         ]
+        # Visually similar pages are useful leads for finding the account, but
+        # they never count as exact evidence for this image.
+        clue_items = sorted(
+            (
+                item
+                for item in unique.values()
+                if not item.verified
+                and (
+                    item.engine in _CLUE_ENGINES
+                    or (item.engine == "google_lens" and item.match_type == "visual")
+                )
+            ),
+            key=lambda item: (
+                item.platform == "X" and "/status/" in item.url,
+                bool(
+                    re.search(
+                        r"(?<![A-Za-z0-9_@])@[A-Za-z0-9_]{1,15}(?![A-Za-z0-9_])",
+                        item.title,
+                    )
+                ),
+            ),
+            reverse=True,
+        )
+        clue_sources = []
+        clue_hosts: set[str] = set()
+        for item in clue_items:
+            host = urlsplit(item.url).hostname
+            if not host or host in clue_hosts:
+                continue
+            clue_hosts.add(host)
+            clue_sources.append({"url": item.url, "title": item.title})
+            if len(clue_sources) == 4:
+                break
         # Inspect a bounded shortlist before selecting the single displayed source.
         chosen = sorted(exact_x, key=_rank, reverse=True)[:3]
         if not chosen:
@@ -756,9 +861,9 @@ class SearchService:
                         sources[-1]["source"] = item.source
                     if len(sources) == 6:
                         break
-            if sources:
+            if sources or clue_sources:
                 title_candidates = []
-                if title_extractor is not None:
+                if sources and title_extractor is not None:
                     try:
                         extracted = await asyncio.wait_for(
                             title_extractor(sources), TITLE_LLM_TIMEOUT
@@ -811,6 +916,11 @@ class SearchService:
                                 if title_candidates
                                 else {}
                             ),
+                            **(
+                                {"extra_sources": clue_sources}
+                                if clue_sources
+                                else {}
+                            ),
                         ),
                         # Recovery returns its partial clues when its own budget
                         # expires; leave time to close its client and return them.
@@ -818,7 +928,7 @@ class SearchService:
                     )
                     report.errors.update(recovery.errors)
                     report.source_pages.update(recovery.source_pages)
-                    if title_extractor is not None:
+                    if sources and title_extractor is not None:
                         report.title_llm.update(
                             checked=recovery.title_accounts_checked,
                             found=recovery.title_accounts_found,
@@ -855,7 +965,7 @@ class SearchService:
                 return result
             try:
                 return await asyncio.wait_for(
-                    self._source_account(result, image), timeout=6
+                    self._source_account(result, image), timeout=10
                 )
             except TimeoutError:
                 return result

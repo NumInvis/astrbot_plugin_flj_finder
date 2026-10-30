@@ -467,6 +467,24 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             collect_account_clues(sources)["artist"], (3, ("source.example",))
         )
 
+    async def test_visual_clue_sources_stay_weak_and_never_verified(self):
+        with patch("x_recovery._fetch_page", AsyncMock(return_value="")):
+            report = await recover_x(
+                picture(),
+                [{"url": "https://exact.example/p", "title": "A cat photo"}],
+                extra_sources=[
+                    {
+                        "url": "https://similar.example/p",
+                        "title": "原帖：https://x.com/visualartist/status/999",
+                    }
+                ],
+            )
+        candidate = report.candidates[0]
+        self.assertEqual(candidate.url, "https://x.com/visualartist/status/999")
+        self.assertFalse(candidate.verified)
+        self.assertEqual(candidate.clue_strength, 1)
+        self.assertIn("相似图来源", candidate.evidence)
+
     async def test_403_records_status_and_continues_to_read_other_sources(self):
         requests = []
 

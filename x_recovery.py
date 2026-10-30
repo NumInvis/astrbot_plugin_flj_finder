@@ -437,6 +437,7 @@ async def recover_x(
     proxy: str | None = None,
     timeout: float = 20,
     title_candidates: list[dict] | None = None,
+    extra_sources: list[dict] | None = None,
 ) -> RecoveryReport:
     report = RecoveryReport()
     clues: list[str] = []
@@ -529,12 +530,13 @@ async def recover_x(
         )
 
     def extract(
-        text: str, evidence: str, *, host: str = "", title: bool = False
+        text: str, evidence: str, *, host: str = "", title: bool = False, weak: bool = False
     ) -> None:
         text = unescape(str(text))[:32_000]
         hosts = (host,) if host else ()
         for url, strength in _text_account_clues(text, title=title):
-            add(url, text[:180], evidence, strength, hosts)
+            # A visually similar page is only a lead: cap its weight at mention level.
+            add(url, text[:180], evidence, min(strength, 1) if weak else strength, hosts)
         for handle in _HANDLE.findall(text)[:3]:
             if handle.lower() not in _RESERVED:
                 clue_hosts[handle] = tuple(
@@ -777,6 +779,24 @@ async def recover_x(
                         strength=2 if "/status/" in str(source.get("url") or "") else 1,
                         hosts=(host,) if host else (),
                     )
+            for source in (extra_sources or [])[:6]:
+                if not isinstance(source, dict):
+                    continue
+                host = _source_host(str(source.get("url") or ""))
+                extract(
+                    str(source.get("title") or ""),
+                    "相似图来源标题明示的 X 线索（待核实）",
+                    host=host,
+                    title=True,
+                    weak=True,
+                )
+                add(
+                    str(source.get("url") or ""),
+                    str(source.get("title") or ""),
+                    "相似图来源明示的 X 链接（待核实）",
+                    strength=1,
+                    hosts=(host,) if host else (),
+                )
             await query_title_accounts("X")
             async with AsyncClient(
                 proxy=proxy, trust_env=False, timeout=5, follow_redirects=False
@@ -786,7 +806,10 @@ async def recover_x(
                 await verify()
                 if not any(candidate.verified for candidate in report.candidates):
                     fetched_hosts: set[str] = set()
-                    for source in sources[:10]:
+                    scan_queue = [(item, False) for item in sources[:10]] + [
+                        (item, True) for item in (extra_sources or [])[:6]
+                    ]
+                    for source, weak in scan_queue:
                         if (
                             not isinstance(source, dict)
                             or not source.get("url")
@@ -821,28 +844,36 @@ async def recover_x(
                                     urljoin(str(source["url"]), href)
                                 )
                                 strength = 2 if "/status/" in linked_url else 1
-                                if _ATTRIBUTION_LABEL.search(
+                                if not weak and _ATTRIBUTION_LABEL.search(
                                     page.link_labels.get(href, "")
                                 ):
                                     strength = 3
                                 add(
                                     linked_url,
                                     "",
-                                    "精确匹配来源页面明示的 X 链接（待核实）",
-                                    strength=strength,
+                                    "相似图来源页面明示的 X 链接（待核实）"
+                                    if weak
+                                    else "精确匹配来源页面明示的 X 链接（待核实）",
+                                    strength=strength if not weak else 1,
                                     hosts=(host,),
                                 )
                             for title in page.titles[:3]:
                                 extract(
                                     title,
-                                    "精确匹配来源页面标题明示的 X 线索（待核实）",
+                                    "相似图来源页面标题明示的 X 线索（待核实）"
+                                    if weak
+                                    else "精确匹配来源页面标题明示的 X 线索（待核实）",
                                     host=host,
                                     title=True,
+                                    weak=weak,
                                 )
                             extract(
                                 " ".join(page.text)[:32_000],
-                                "精确匹配来源页面明示的 X 账号线索（待核实）",
+                                "相似图来源页面明示的 X 账号线索（待核实）"
+                                if weak
+                                else "精确匹配来源页面明示的 X 账号线索（待核实）",
                                 host=host,
+                                weak=weak,
                             )
                             if any(
                                 "/status/" in candidate.url

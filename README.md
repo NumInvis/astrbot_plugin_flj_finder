@@ -39,12 +39,18 @@ Bot： [成功表情图]
 
 | 引擎 | 用途 | 配置 |
 | --- | --- | --- |
-| Google Lens | 只查询完全匹配 `exact_matches` | 默认直连；可填写 SerpApi Key 使用 API 通道 |
+| Google Lens | 查询完全匹配 `exact_matches`；可另开相似图 `visual_matches` 作为线索 | 默认直连；可填写 SerpApi Key 使用 API 通道 |
 | 百度识图 | 补充同图页面；非 X 页面只用于提取线索 | 默认启用 |
-| Ascii2D | 补充图片索引 | 默认启用，可能遇到 403 / 验证码 |
+| Copyseeker | 按图检索收录该图的页面，常直接给出 X 帖子链接 | 默认启用；服务器访问较慢时属正常 |
+| Yandex | 只返回相似图页面，作为待核实线索，不作同图证明 | 默认启用；走 `yandex.ru` |
+| Ascii2D | 补充图片索引 | 可选，可能遇到 403 / 验证码 |
 | SauceNAO | 补充有相似度的图片索引 | 可选；填写 API Key 后自动加入 |
 
-各引擎并行检索，单个引擎失败不会丢弃其他结果。先返回有同图证据的 X 结果。没有直接命中 X，但取得了其他平台的同图页面时：
+各引擎并行检索，单个引擎失败不会丢弃其他结果。先返回有同图证据的 X 结果。完全匹配之外，还会把相似图结果（Yandex、Google 相似图）里明示的 X 帖子或账号作为**待核实线索**一起追查；这类线索强度固定为最低级，不会被当成同图证明，也不会因此认定账号归属。
+
+追查到 X 帖子但页面拿不到作者显示名时，改用 fxTwitter 公共接口读取作者账号、显示名和关注者数；作者与候选不一致时会清空该线索，避免张冠李戴。
+
+没有直接命中 X，但取得了其他平台的同图页面时：
 
 1. 从标题提取明确的 X 链接、`@handle` 或带分隔符的署名；必要时读取最多 3 个公开来源页面。
 2. 使用已启用的 [astrbot_plugin_twitter](https://github.com/Ars1027/astrbot_plugin_twitter) 的 Nitter 地址搜索关键词；不可用或为空时，使用 SerpApi 搜索限定为 X/Twitter 域名的网页。
@@ -70,7 +76,7 @@ Google 可能给服务器返回 HTTP 200 的 JavaScript 验证页，实际没有
 
 在插件配置填写 `serpapi_api_key` 后，`google_lens` 使用 [SerpApi Google Lens API](https://serpapi.com/google-lens-api)。API 支持浏览器中的“完全匹配”，参数为 [`type=exact_matches`](https://serpapi.com/google-lens-exact-matches-api)。这是第三方检索服务，需要它自己的 Key；Google 模型 Key 或普通聊天模型 Key 不适用。可从 [SerpApi 控制台](https://serpapi.com/manage-api-key) 取得后在 AstrBot 面板填写，无需把 Key 发到聊天里。
 
-API 通道上传后只查一次完全匹配，不回退到外观匹配；Lens 和 X 网页检索均设置 `safe=off`，对应浏览器关闭安全搜索。没有直接命中 X 时，来源追查最多追加两次关键词网页检索，**一次找图最多三次 SerpApi 搜索请求**，不自动重试；额度和计费以服务商账户为准。上传前会按 [Image API](https://serpapi.com/image-api) 的 500 KB 上限压缩图片，不需要额外图床。Key 留空时 Google Lens 使用直连通道，X 关键词追查仍可使用已配置的 Nitter。
+API 通道上传后固定查询一次完全匹配；`serpapi_visual_matches` 开启时再加查一次相似图（仅作线索，失败不影响完全匹配结果）。Lens 和 X 网页检索均设置 `safe=off`，对应浏览器关闭安全搜索。没有直接命中 X 时，来源追查最多追加两次关键词网页检索，**一次找图最多四次 SerpApi 搜索请求**（含相似图时），不自动重试；额度和计费以服务商账户为准。上传前会按 [Image API](https://serpapi.com/image-api) 的 500 KB 上限压缩图片，不需要额外图床。Key 留空时 Google Lens 使用直连通道，X 关键词追查仍可使用已配置的 Nitter。
 
 ## 安装
 
@@ -107,9 +113,10 @@ Docker 部署应将插件放入挂载的 `data/plugins`，依赖安装在 AstrBo
 | --- | --- | --- |
 | `group_whitelist` | `[]` | 允许的 QQ 群号；空名单不允许群聊使用 |
 | `private_qq_whitelist` | `[]` | 允许私聊使用的 QQ 号；不放行群聊 |
-| `engines` | `google_lens`, `baidu`, `ascii2d` | 启用的识图引擎 |
+| `engines` | `google_lens`, `baidu`, `copyseeker`, `yandex` | 启用的识图引擎；`copyseeker` 可直接给出 X 帖子 |
 | `proxy` | 空 | 识图请求的 HTTP(S) 代理；空为直连 |
 | `serpapi_api_key` | 空 | Google Lens 的 SerpApi Key；填写后启用 API 通道 |
+| `serpapi_visual_matches` | `true` | API 通道额外查询相似图，仅作待核实线索；每次多耗一次额度 |
 | `search_timeout` | `30` | 每个引擎的检索上限，单位秒 |
 | `x_lookup_timeout` | `20` | 没有直接命中 X 时，来源追查的总上限，范围 5–30 秒 |
 | `use_title_llm` | `true` | 没有直接 X 同图结果时调用模型解析来源文字 |
